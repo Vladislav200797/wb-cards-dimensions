@@ -1,16 +1,27 @@
 import os
-import math
 import time
 import requests
-from supabase import create_client, Client
 
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
+# ==========
+# ENV
+# ==========
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 WB_API_TOKEN = os.environ["WB_API_TOKEN_CONTENT"]
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+SUPABASE_REST_URL = f"{SUPABASE_URL}/rest/v1"
 
+# Заголовки для Supabase REST
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    "Content-Type": "application/json",
+}
+
+# ==========
+# WB API
+# ==========
 WB_URL = "https://content-api.wildberries.ru/content/v2/get/cards/list"
 
 
@@ -25,8 +36,7 @@ def iter_wb_cards(limit: int = 100):
 
     cursor = {"limit": limit}
     filter_ = {
-        "withPhoto": -1,   # неважно, просто тупо всё
-        # можно добавить textSearch / brand / objectIDs, если захочешь фильтрацию
+        "withPhoto": -1,  # можно добавить textSearch / brand / objectIDs при необходимости
     }
 
     while True:
@@ -115,11 +125,45 @@ def build_row_from_card(card: dict) -> dict | None:
     return row
 
 
+# ==========
+# Supabase helper'ы
+# ==========
+
+def delete_all_rows():
+    """
+    Полностью очищаем таблицу wb_cards_dimensions.
+    Supabase REST требует фильтр, поэтому ставим nm_id=gt.0 (nmID всегда > 0).
+    """
+    url = f"{SUPABASE_REST_URL}/wb_cards_dimensions"
+    params = {"nm_id": "gt.0"}
+    print("Deleting old data from wb_cards_dimensions...")
+    resp = requests.delete(url, headers=SUPABASE_HEADERS, params=params, timeout=60)
+    resp.raise_for_status()
+    print("Delete status:", resp.status_code)
+
+
+def insert_rows_batch(batch: list[dict]):
+    """
+    Вставка батча строк в wb_cards_dimensions.
+    """
+    if not batch:
+        return
+
+    url = f"{SUPABASE_REST_URL}/wb_cards_dimensions"
+    headers = {
+        **SUPABASE_HEADERS,
+        "Prefer": "return=none",  # нам не нужно тело ответа
+    }
+    resp = requests.post(url, headers=headers, json=batch, timeout=60)
+    resp.raise_for_status()
+
+
 def refresh_supabase_table():
     """
     Полное обновление таблицы:
-    1) очищаем wb_cards_dimensions
-    2) вставляем новые данные батчами
+    1) тянем все карточки с габаритами
+    2) очищаем таблицу
+    3) вставляем новые данные батчами
     """
     print("Fetching cards from Wildberries...")
 
@@ -133,8 +177,7 @@ def refresh_supabase_table():
     print(f"Total rows with dimensions: {len(rows)}")
 
     # Очищаем таблицу
-    print("Deleting old data from wb_cards_dimensions...")
-    supabase.table("wb_cards_dimensions").delete().neq("nm_id", 0).execute()
+    delete_all_rows()
 
     # Вставляем батчами
     batch_size = 500
@@ -142,10 +185,9 @@ def refresh_supabase_table():
     print("Inserting new data into wb_cards_dimensions...")
 
     for i in range(0, total, batch_size):
-        batch = rows[i : i + batch_size]
-        print(f"Inserting batch {i}..{i+len(batch)-1}")
-        supabase.table("wb_cards_dimensions").insert(batch).execute()
-        # Можно чуть притормозить, если переживаешь за лимиты
+        batch = rows[i: i + batch_size]
+        print(f"Inserting batch {i}..{i + len(batch) - 1}")
+        insert_rows_batch(batch)
         time.sleep(0.2)
 
     print("Done.")
